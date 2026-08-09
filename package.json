@@ -1,0 +1,17 @@
+{
+  "name": "deepseek-updates-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "定时抓取 DeepSeek API 更新日志，检测新条目并通过邮件/即时通讯渠道推送通知",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node scripts/check-updates.mjs",
+    "verify:fixture": "node test/verify_fixture.mjs"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  }
+}

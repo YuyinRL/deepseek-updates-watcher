@@ -1,0 +1,67 @@
+name: Watch DeepSeek API Updates
+
+on:
+  schedule:
+    # 每小时运行一次（UTC 时间，GitHub Actions 的 cron 使用 UTC）
+    - cron: '0 * * * *'
+  workflow_dispatch: # 支持在 Actions 页面手动触发
+
+permissions:
+  contents: write # 允许自动提交 last-update.json
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 检查更新日志
+        id: check
+        run: node scripts/check-updates.mjs
+        env:
+          PAGE_URL: ${{ secrets.PAGE_URL }}
+          NOTIFY_ON_FIRST_RUN: ${{ secrets.NOTIFY_ON_FIRST_RUN }}
+          # SMTP 邮件
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_SECURE: ${{ secrets.SMTP_SECURE }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          # Server酱
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          # PushPlus
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          # Telegram
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Discord
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # Slack
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          # ntfy
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+          # Bark
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+
+      - name: 提交状态快照
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last-update.json
+          git commit -m "chore: update DeepSeek changelog snapshot"
+          git push
