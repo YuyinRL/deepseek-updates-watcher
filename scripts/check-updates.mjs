@@ -7,7 +7,7 @@
  *   1. 抓取更新日志页面 HTML（带重试与超时）
  *   2. 用 parseUpdates() 解析出全部更新条目
  *   3. 读取状态文件，分别对比「最近检测」与「最近已通知」快照
- *   4. 按 UTC+8 静默期、变化即时通知和两小时状态通知规则作出决策
+ *   4. 按渠道执行：更新即时通知、邮件两小时状态、微信 18:00 日报
  *   5. 原子写入状态，并在通知失败时保留待通知变化供下一轮重试
  *
  * 支持的通知渠道（均为可选项，未配置相关环境变量即自动跳过）：
@@ -22,7 +22,11 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { parseUpdates } from './parse-updates.mjs';
-import { buildNextState, decideNotification } from './notification-policy.mjs';
+import {
+  commitChannelDelivery,
+  decideChannelNotification,
+  getUtc8Schedule,
+} from './notification-policy.mjs';
 
 // ---------------------------------------------------------------------------
 // 环境配置与常量
@@ -270,6 +274,67 @@ function buildPeriodicHtml(entries, pageUrl, checkedAt) {
   </div>`;
 }
 
+function buildDailySummaryText(activities, pageUrl) {
+  const lines = ['DeepSeek API 更新日志监控日报', ''];
+  for (const activity of activities) {
+    lines.push(`日期：${activity.date}（UTC+8）`);
+    lines.push(`成功检测：${activity.checks} 次`);
+    lines.push(`页面变化：${activity.changes.length} 次`);
+    lines.push(`最近条目：${activity.latestEntry?.date ?? '未知'} | ${activity.latestEntry?.title ?? '无'}`);
+    if (activity.changes.length === 0) {
+      lines.push('结论：当天截至汇总时未检测到更新。');
+    } else {
+      lines.push('变化明细：');
+      for (const change of activity.changes) {
+        const titles = change.items.length > 0
+          ? change.items.map((item) => `${item.date} | ${item.title}`).join('；')
+          : '页面内容发生变化（未识别出新增条目）';
+        lines.push(`- ${change.localTime}：${titles}`);
+      }
+    }
+    lines.push('');
+  }
+  lines.push('监控状态：正常运行，每 5 分钟检测一次。');
+  lines.push(`页面链接：${pageUrl}`);
+  return lines.join('\n');
+}
+
+function buildDailySummaryHtml(activities, pageUrl) {
+  const sections = activities.map((activity) => {
+    const changes = activity.changes.length === 0
+      ? '<p>当天截至汇总时未检测到更新。</p>'
+      : `<ul>${activity.changes.map((change) => {
+          const titles = change.items.length > 0
+            ? change.items.map((item) => `${escapeHtml(item.date)} — ${escapeHtml(item.title)}`).join('；')
+            : '页面内容发生变化（未识别出新增条目）';
+          return `<li>${escapeHtml(change.localTime)}：${titles}</li>`;
+        }).join('')}</ul>`;
+    return `
+      <section style="margin:16px 0;padding:12px;border:1px solid #e0e0e0;border-radius:8px;">
+        <h3 style="margin-top:0;">${escapeHtml(activity.date)}（UTC+8）</h3>
+        <p>成功检测：${activity.checks} 次<br>页面变化：${activity.changes.length} 次<br>最近条目：${escapeHtml(activity.latestEntry?.date ?? '未知')} — ${escapeHtml(activity.latestEntry?.title ?? '无')}</p>
+        ${changes}
+      </section>`;
+  }).join('');
+  return `
+  <div style="font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;max-width:640px;margin:0 auto;color:#222;">
+    <h2>DeepSeek API 更新日志监控日报</h2>
+    ${sections}
+    <p>监控状态：正常运行，每 5 分钟检测一次。</p>
+    <p><a href="${escapeHtml(pageUrl)}">打开更新日志页面 →</a></p>
+  </div>`;
+}
+
+function appendSummaryToPayload(payload, activities) {
+  const summaryText = buildDailySummaryText(activities, PAGE_URL);
+  const summaryHtml = buildDailySummaryHtml(activities, PAGE_URL);
+  return {
+    subject: `${payload.subject}（含 18:00 日报）`,
+    text: `${payload.text}\n\n----------------\n\n${summaryText}`,
+    html: `${payload.html}<hr>${summaryHtml}`,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 通知渠道实现
 // 每个渠道返回 true 表示已配置并已发送；返回 false 表示未配置（跳过）；
@@ -389,34 +454,40 @@ async function sendBark({ subject, text }) {
 
 // 渠道清单（顺序即发送顺序）：envVars 用于"未配置渠道"时的提示信息
 const CHANNELS = [
-  { name: 'SMTP邮件', envVars: ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'MAIL_TO'], send: sendSmtp },
-  { name: 'Server酱', envVars: ['SERVERCHAN_SENDKEY'], send: sendServerChan },
-  { name: 'PushPlus', envVars: ['PUSHPLUS_TOKEN'], send: sendPushPlus },
-  { name: 'Telegram', envVars: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'], send: sendTelegram },
-  { name: 'Discord', envVars: ['DISCORD_WEBHOOK'], send: sendDiscord },
-  { name: 'Slack', envVars: ['SLACK_WEBHOOK'], send: sendSlack },
-  { name: 'ntfy', envVars: ['NTFY_TOPIC'], send: sendNtfy },
-  { name: 'Bark', envVars: ['BARK_KEY'], send: sendBark },
+  { id: 'smtp', kind: 'email', name: 'SMTP邮件', envVars: ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'MAIL_TO'], send: sendSmtp },
+  { id: 'serverchan', kind: 'wechat', name: 'Server酱', envVars: ['SERVERCHAN_SENDKEY'], send: sendServerChan },
+  { id: 'pushplus', kind: 'wechat', name: 'PushPlus', envVars: ['PUSHPLUS_TOKEN'], send: sendPushPlus },
+  { id: 'telegram', kind: 'standard', name: 'Telegram', envVars: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'], send: sendTelegram },
+  { id: 'discord', kind: 'standard', name: 'Discord', envVars: ['DISCORD_WEBHOOK'], send: sendDiscord },
+  { id: 'slack', kind: 'standard', name: 'Slack', envVars: ['SLACK_WEBHOOK'], send: sendSlack },
+  { id: 'ntfy', kind: 'standard', name: 'ntfy', envVars: ['NTFY_TOPIC'], send: sendNtfy },
+  { id: 'bark', kind: 'standard', name: 'Bark', envVars: ['BARK_KEY'], send: sendBark },
 ];
 
-// 发送到所有已配置渠道；每个渠道独立 try/catch，单点失败不影响其他渠道。
-// 返回 { configured, ok }，供调用方判断"全部失败"或"未配置任何渠道"。
-async function sendAllChannels(configuredChannels, payload) {
-  let configured = 0;
-  let ok = 0;
-  for (const ch of configuredChannels) {
-    try {
-      const sent = await ch.send(payload);
-      if (!sent) continue; // 未配置，跳过
-      configured++;
-      ok++;
-      log(`[OK] ${ch.name} 通知发送成功`);
-    } catch (err) {
-      configured++;
-      log(`[FAIL] ${ch.name} 通知发送失败：${err.message}`);
-    }
+function updateDailyActivities({ state, schedule, checkedAt, observedChanged, newItems, entries }) {
+  const activities = structuredClone(state?.dailyActivities ?? {});
+  const activity = activities[schedule.localDate] ?? {
+    date: schedule.localDate,
+    checks: 0,
+    changes: [],
+  };
+
+  activity.checks += 1;
+  activity.lastCheckedAt = checkedAt.toISOString();
+  activity.latestEntry = entries[0] ?? null;
+  activity.entriesCount = entries.length;
+  if (observedChanged) {
+    activity.changes.push({
+      detectedAt: checkedAt.toISOString(),
+      localTime: schedule.localTime,
+      items: newItems.map((item) => ({ date: item.date, title: item.title })),
+    });
   }
-  return { configured, ok };
+  activities[schedule.localDate] = activity;
+
+  // Keep one month of compact summaries for delayed 18:00 delivery and audits.
+  const retainedDates = Object.keys(activities).sort().slice(-31);
+  return Object.fromEntries(retainedDates.map((date) => [date, activities[date]]));
 }
 
 // ---------------------------------------------------------------------------
@@ -448,111 +519,142 @@ export async function runCheck({ now } = {}) {
   const isFirstRun = !state || state.entries.length === 0;
   if (isFirstRun) log('当前为首次运行（状态文件为空或不存在）');
 
-  // 4. 计算内容哈希并对比（哈希 = 全部条目「日期+标题」的 SHA-256）
+  // 4. 计算观察状态，并记录当天检测和变化，供微信 18:00 日报汇总。
   const newMeta = entries.map((e) => ({ date: e.date, title: e.title }));
   const newHash = computeHash(newMeta);
-  // 兼容旧版状态文件（有 entries 但无 hash 字段）：用旧 entries 现算一个 hash 做迁移比对
   const oldHash = state?.hash ?? (state?.entries?.length ? computeHash(state.entries) : null);
-  const changed = newHash !== oldHash;
-  const decision = decideNotification({ now: checkedAt, currentHash: newHash, state });
-  const oldKeys = new Set(decision.notified.entries.map((e) => `${e.date}|${e.title}`));
-  const newItems = entries.filter((e) => !oldKeys.has(`${e.date}|${e.title}`));
-  log(`内容哈希：${newHash.slice(0, 12)}… ${changed ? '（与上次检测不同）' : '（与上次检测一致）'}`);
-  log(`UTC+8 时间：${decision.localDate} ${decision.localTime}${decision.quiet ? '（静默时段）' : ''}`);
+  const observedChanged = oldHash !== null && newHash !== oldHash;
+  const observedOldKeys = new Set((state?.entries ?? []).map((e) => `${e.date}|${e.title}`));
+  const observedNewItems = entries.filter((e) => !observedOldKeys.has(`${e.date}|${e.title}`));
+  const schedule = getUtc8Schedule(checkedAt);
+  const dailyActivities = updateDailyActivities({
+    state,
+    schedule,
+    checkedAt,
+    observedChanged,
+    newItems: observedNewItems,
+    entries: newMeta,
+  });
+  log(`内容哈希：${newHash.slice(0, 12)}… ${observedChanged ? '（与上次检测不同）' : '（与上次检测一致）'}`);
+  log(`UTC+8 时间：${schedule.localDate} ${schedule.localTime}${schedule.quiet ? '（常规消息静默时段，更新仍会立即发送）' : ''}`);
 
-  // 5. 00:00-08:00 仍持续检测并更新 observed snapshot，但绝不发送通知。
-  // notified snapshot 保持不变，因此夜间积累的变化会在 08:00 后补发。
-  if (decision.quiet) {
-    log(decision.changedSinceNotification
-      ? '静默时段检测到尚未通知的变化：已暂存，08:00 后补发'
-      : '静默时段：本次无待通知变化');
-    if (!DRY_RUN) {
-      writeState(STATE_FILE, buildNextState({ now: checkedAt, entries: newMeta, hash: newHash, previousState: state, decision }));
-      appendGithubOutput(['state_changed=true']);
-    }
-    return 0;
-  }
-
-  // 白天没有变化且当前两小时周期已通知过，只更新健康检查时间。
-  if (!decision.shouldNotify) {
-    log('无更新，且当前两小时通知已发送：跳过通知');
-    if (!DRY_RUN) writeState(STATE_FILE, buildNextState({ now: checkedAt, entries: newMeta, hash: newHash, previousState: state, decision }));
-    return 0;
-  }
-
-  // 6. 模型发布检测，决定标题前缀
-  const isRelease = decision.changedSinceNotification && newItems.some(isModelReleaseItem);
-  const prefix = newItems.length > 0 ? (isRelease ? '🚀 新模型发布：' : '📢 更新日志：') : '📢 更新日志：';
-  const subject = buildSubject(prefix, newItems);
-  const isFirstNotification = decision.notified.hash === null;
-  log(decision.changedSinceNotification
-    ? `准备发送变化通知：${newItems.length} 条新条目${isFirstNotification ? '（首次通知）' : ''}${isRelease ? '，判定为新模型发布' : ''}`
-    : `当前 ${decision.periodicSlot.id} 两小时状态通知尚未发送`);
-
-  // 7. 构建通知内容（首次运行只发"监控已启动"确认消息）
-  const payload = isFirstNotification
-    ? { subject: '🚀 DeepSeek API 更新日志监控已启动', text: buildStartupText(entries, PAGE_URL), html: buildStartupHtml(entries, PAGE_URL) }
-    : decision.changedSinceNotification
-      ? { subject, text: buildNotificationText(newItems, PAGE_URL), html: buildNotificationHtml(newItems, PAGE_URL) }
-      : {
-          subject: 'DeepSeek API 更新日志：定时状态正常',
-          text: buildPeriodicText(entries, PAGE_URL, `${decision.localDate} ${decision.localTime}`),
-          html: buildPeriodicHtml(entries, PAGE_URL, `${decision.localDate} ${decision.localTime}`),
-        };
-  // 已配置的渠道：所需环境变量全部非空（GitHub Actions 中未填写的 Secret 为空字符串，同样视为未配置）
+  // 5. 每个渠道独立判定和提交状态，某个渠道失败不会被其他渠道的成功掩盖。
   const configuredChannels = CHANNELS.filter((c) => c.envVars.every((v) => env[v]));
+  const deliveries = structuredClone(state?.deliveries ?? {});
+  const activityDates = Object.keys(dailyActivities);
+  let exitCode = 0;
 
-  // 8. DRY_RUN：仅打印"将要发生什么"，不产生任何副作用
-  if (DRY_RUN) {
-    log(`DRY_RUN：将发送${decision.changedSinceNotification ? '变化' : '两小时状态'}通知（标题：${payload.subject}）`);
-    log(`DRY_RUN：共 ${configuredChannels.length} 个渠道已配置，实际不发送`);
-    for (const ch of configuredChannels) {
-      log(`DRY_RUN：  渠道 ${ch.name}（env: ${ch.envVars.join(', ')}）`);
+  if (configuredChannels.length === 0) {
+    warn('未配置任何通知渠道；检测状态会保存，但无法发送通知。');
+    if (!DRY_RUN) exitCode = 1;
+  }
+
+  for (const channel of configuredChannels) {
+    const decision = decideChannelNotification({
+      now: checkedAt,
+      currentHash: newHash,
+      state,
+      channel,
+      activityDates,
+    });
+    // Persist migrated per-channel state even when no message is due.
+    deliveries[channel.id] = decision.delivery;
+
+    if (!decision.shouldNotify) {
+      log(channel.kind === 'wechat'
+        ? `${channel.name}：无更新，且今日 18:00 日报无需发送`
+        : `${channel.name}：无更新，且当前两小时状态已发送或仍在静默时段`);
+      continue;
     }
-    log(`DRY_RUN：将写入 schemaVersion=2 状态文件（${newMeta.length} 条快照）`);
-    log('DRY_RUN 结束：未发送任何通知、未写入状态文件');
+
+    const channelOldKeys = new Set(decision.delivery.notifiedEntries.map((e) => `${e.date}|${e.title}`));
+    const channelNewItems = entries.filter((e) => !channelOldKeys.has(`${e.date}|${e.title}`));
+    const isRelease = decision.changedSinceNotification && channelNewItems.some(isModelReleaseItem);
+    const isFirstNotification = decision.delivery.notifiedHash === null;
+    let payload;
+
+    if (isFirstNotification) {
+      payload = {
+        subject: '🚀 DeepSeek API 更新日志监控已启动',
+        text: buildStartupText(entries, PAGE_URL),
+        html: buildStartupHtml(entries, PAGE_URL),
+      };
+    } else if (decision.changedSinceNotification) {
+      const prefix = channelNewItems.length > 0
+        ? (isRelease ? '🚀 新模型发布：' : '📢 更新日志：')
+        : '📢 更新日志：';
+      payload = {
+        subject: buildSubject(prefix, channelNewItems),
+        text: buildNotificationText(channelNewItems, PAGE_URL),
+        html: buildNotificationHtml(channelNewItems, PAGE_URL),
+      };
+    } else if (channel.kind === 'wechat') {
+      const activities = decision.summaryDates.map((date) => dailyActivities[date]);
+      payload = {
+        subject: `DeepSeek 监控日报：${decision.summaryDates.at(-1)}`,
+        text: buildDailySummaryText(activities, PAGE_URL),
+        html: buildDailySummaryHtml(activities, PAGE_URL),
+      };
+    } else {
+      payload = {
+        subject: 'DeepSeek API 更新日志：定时状态正常',
+        text: buildPeriodicText(entries, PAGE_URL, `${schedule.localDate} ${schedule.localTime}`),
+        html: buildPeriodicHtml(entries, PAGE_URL, `${schedule.localDate} ${schedule.localTime}`),
+      };
+    }
+
+    if (channel.kind === 'wechat' && decision.changedSinceNotification && decision.summaryDue) {
+      payload = appendSummaryToPayload(
+        payload,
+        decision.summaryDates.map((date) => dailyActivities[date]),
+      );
+    }
+
+    if (DRY_RUN) {
+      const reason = decision.changedSinceNotification
+        ? '更新即时通知'
+        : (channel.kind === 'wechat' ? '18:00 日报' : '两小时状态');
+      log(`DRY_RUN：${channel.name} 将发送${reason}（${payload.subject}）`);
+      continue;
+    }
+
+    if (isFirstNotification && !NOTIFY_ON_FIRST_RUN) {
+      log(`${channel.name}：首次运行且 NOTIFY_ON_FIRST_RUN=false，记录基线但不发送`);
+      deliveries[channel.id] = commitChannelDelivery({ now: checkedAt, entries: newMeta, hash: newHash, decision });
+      continue;
+    }
+
+    try {
+      const sent = await channel.send(payload);
+      if (!sent) throw new Error('渠道配置在发送前变为不可用');
+      deliveries[channel.id] = commitChannelDelivery({ now: checkedAt, entries: newMeta, hash: newHash, decision });
+      log(`[OK] ${channel.name} 通知发送成功`);
+    } catch (err) {
+      error(`[FAIL] ${channel.name} 通知发送失败：${err.message}`);
+      exitCode = 1;
+    }
+  }
+
+  if (DRY_RUN) {
+    log(`DRY_RUN：将写入 schemaVersion=3 状态文件；实际未发送、未写入`);
     return 0;
   }
 
-  // 9. 发送通知：首次运行且关闭确认消息时跳过
-  let notificationCommitted = false;
-  let exitCode = 0;
-  if (isFirstNotification && !NOTIFY_ON_FIRST_RUN) {
-    log('首次运行，且 NOTIFY_ON_FIRST_RUN=false，跳过通知发送');
-    notificationCommitted = true;
-  } else {
-    const { configured, ok } = await sendAllChannels(configuredChannels, payload);
-
-    if (configured === 0) {
-      // 没有渠道时保留待通知状态并返回失败，常驻运行器会在下一周期重试。
-      warn('未配置任何通知渠道。可配置的渠道及所需环境变量：');
-      for (const ch of CHANNELS) warn(`  ${ch.name}：${ch.envVars.join('、')}`);
-      warn('请在 .env 中配置至少一个通知渠道；本次不会把待通知变化标记为已发送。');
-      exitCode = 1;
-    } else if (ok === 0) {
-      error(`已配置 ${configured} 个渠道但全部发送失败`);
-      exitCode = 1;
-    } else {
-      notificationCommitted = true;
-      if (ok < configured) warn(`${configured} 个已配置渠道中有 ${configured - ok} 个发送失败`);
-    }
-  }
-
-  // 10. 无论发送成功与否都保存观察快照；只有成功时才推进 notified snapshot。
-  writeState(STATE_FILE, buildNextState({
-    now: checkedAt,
+  // 6. 保存观察、日报和各渠道独立投递状态。
+  writeState(STATE_FILE, {
+    schemaVersion: 3,
+    checkedAt: checkedAt.toISOString(),
     entries: newMeta,
     hash: newHash,
-    previousState: state,
-    decision,
-    notificationCommitted,
-  }));
+    dailyActivities,
+    deliveries,
+  });
   appendGithubOutput([
     'state_changed=true',
-    `has_changes=${decision.changedSinceNotification}`,
-    `new_release=${isRelease}`,
+    `has_changes=${observedChanged}`,
+    `new_release=${observedNewItems.some(isModelReleaseItem)}`,
   ]);
-  log(notificationCommitted ? '状态已更新，通知已确认' : '观察状态已更新，待通知状态保留以便下次重试');
+  log(exitCode === 0 ? '观察状态和分渠道通知状态已更新' : '观察状态已更新；失败渠道保留待发送状态供下轮重试');
 
   return exitCode;
 }

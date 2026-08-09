@@ -26,6 +26,7 @@ export function getUtc8Schedule(now = new Date()) {
   if (quiet) {
     return {
       quiet,
+      hour,
       localDate,
       localTime: `${pad2(hour)}:${pad2(minute)}:${pad2(second)}`,
       periodicSlot: null,
@@ -35,6 +36,7 @@ export function getUtc8Schedule(now = new Date()) {
   const slotHour = 8 + Math.floor((hour - 8) / 2) * 2;
   return {
     quiet,
+    hour,
     localDate,
     localTime: `${pad2(hour)}:${pad2(minute)}:${pad2(second)}`,
     periodicSlot: {
@@ -42,6 +44,89 @@ export function getUtc8Schedule(now = new Date()) {
       id: `${localDate}T${pad2(slotHour)}:00:00+08:00`,
     },
   };
+}
+
+export function getChannelDelivery(state, channel) {
+  const existing = state?.deliveries?.[channel.id];
+  if (existing) {
+    return {
+      notifiedEntries: existing.notifiedEntries ?? [],
+      notifiedHash: existing.notifiedHash ?? null,
+      notifiedAt: existing.notifiedAt ?? null,
+      lastPeriodicSlot: existing.lastPeriodicSlot ?? null,
+      lastDailySummaryDate: existing.lastDailySummaryDate ?? null,
+    };
+  }
+
+  // A channel added after schema v3 starts from the current observation instead
+  // of replaying the entire historical changelog.
+  const migrated = state?.schemaVersion >= 3
+    ? { entries: state.entries ?? [], hash: state.hash ?? null, notifiedAt: state.checkedAt ?? null }
+    : getNotifiedSnapshot(state);
+
+  return {
+    notifiedEntries: migrated.entries,
+    notifiedHash: migrated.hash,
+    notifiedAt: migrated.notifiedAt,
+    lastPeriodicSlot: channel.kind === 'wechat' ? null : (state?.lastPeriodicSlot ?? null),
+    // The last old-style periodic status already delivered today counts as the
+    // migration-day WeChat summary, avoiding a duplicate message on deployment.
+    lastDailySummaryDate: channel.kind === 'wechat' && state?.lastPeriodicSlot
+      ? state.lastPeriodicSlot.slice(0, 10)
+      : null,
+  };
+}
+
+export function decideChannelNotification({
+  now = new Date(),
+  currentHash,
+  state,
+  channel,
+  activityDates = [],
+}) {
+  const schedule = getUtc8Schedule(now);
+  const delivery = getChannelDelivery(state, channel);
+  const changedSinceNotification = currentHash !== delivery.notifiedHash;
+
+  if (channel.kind === 'wechat') {
+    const summaryDates = schedule.hour >= 18
+      ? activityDates
+          .filter((date) => date <= schedule.localDate && (!delivery.lastDailySummaryDate || date > delivery.lastDailySummaryDate))
+          .sort()
+      : [];
+    return {
+      ...schedule,
+      delivery,
+      changedSinceNotification,
+      periodicDue: false,
+      summaryDates,
+      summaryDue: summaryDates.length > 0,
+      shouldNotify: changedSinceNotification || summaryDates.length > 0,
+    };
+  }
+
+  const periodicDue = !!schedule.periodicSlot && delivery.lastPeriodicSlot !== schedule.periodicSlot.id;
+  return {
+    ...schedule,
+    delivery,
+    changedSinceNotification,
+    periodicDue,
+    summaryDates: [],
+    summaryDue: false,
+    shouldNotify: changedSinceNotification || periodicDue,
+  };
+}
+
+export function commitChannelDelivery({ now, entries, hash, decision }) {
+  const next = { ...decision.delivery };
+  if (decision.changedSinceNotification) {
+    next.notifiedEntries = entries;
+    next.notifiedHash = hash;
+    next.notifiedAt = now.toISOString();
+  }
+  if (decision.periodicDue) next.lastPeriodicSlot = decision.periodicSlot.id;
+  if (decision.summaryDue) next.lastDailySummaryDate = decision.summaryDates.at(-1);
+  return next;
 }
 
 /**
@@ -54,47 +139,5 @@ export function getNotifiedSnapshot(state) {
     entries: hasOwn(state, 'notifiedEntries') ? (state.notifiedEntries ?? []) : (state.entries ?? []),
     hash: hasOwn(state, 'notifiedHash') ? state.notifiedHash : (state.hash ?? null),
     notifiedAt: hasOwn(state, 'notifiedAt') ? state.notifiedAt : (state.checkedAt ?? null),
-  };
-}
-
-export function decideNotification({ now = new Date(), currentHash, state }) {
-  const schedule = getUtc8Schedule(now);
-  const notified = getNotifiedSnapshot(state);
-  const changedSinceNotification = currentHash !== notified.hash;
-  const periodicDue = !!schedule.periodicSlot && state?.lastPeriodicSlot !== schedule.periodicSlot.id;
-  const shouldNotify = !schedule.quiet && (changedSinceNotification || periodicDue);
-
-  return {
-    ...schedule,
-    notified,
-    changedSinceNotification,
-    periodicDue,
-    shouldNotify,
-    reason: changedSinceNotification ? 'change' : (periodicDue ? 'periodic' : 'none'),
-  };
-}
-
-export function buildNextState({
-  now = new Date(),
-  entries,
-  hash,
-  previousState,
-  decision,
-  notificationCommitted = false,
-}) {
-  const previousNotified = getNotifiedSnapshot(previousState);
-  const committed = decision.shouldNotify && notificationCommitted;
-
-  return {
-    schemaVersion: 2,
-    checkedAt: now.toISOString(),
-    entries,
-    hash,
-    notifiedAt: committed ? now.toISOString() : previousNotified.notifiedAt,
-    notifiedEntries: committed ? entries : previousNotified.entries,
-    notifiedHash: committed ? hash : previousNotified.hash,
-    lastPeriodicSlot: committed && decision.periodicDue
-      ? decision.periodicSlot.id
-      : (previousState?.lastPeriodicSlot ?? null),
   };
 }

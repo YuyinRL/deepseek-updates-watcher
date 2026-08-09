@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildNextState,
-  decideNotification,
+  commitChannelDelivery,
+  decideChannelNotification,
+  getChannelDelivery,
   getNotifiedSnapshot,
   getUtc8Schedule,
 } from '../scripts/notification-policy.mjs';
+
+const emailChannel = { id: 'smtp', kind: 'email' };
+const wechatChannel = { id: 'serverchan', kind: 'wechat' };
 
 const oldState = {
   checkedAt: '2026-08-08T12:00:00.000Z',
@@ -43,76 +47,116 @@ test('periodic slots are fixed at 08:00, 10:00, ..., 22:00 UTC+8', () => {
   );
 });
 
-test('a nighttime change is observed but remains pending until 08:00', () => {
-  const night = new Date('2026-08-08T18:05:00Z'); // 02:05 UTC+8
-  const decision = decideNotification({ now: night, currentHash: 'new-hash', state: oldState });
-  assert.equal(decision.quiet, true);
-  assert.equal(decision.changedSinceNotification, true);
-  assert.equal(decision.shouldNotify, false);
-
-  const pendingState = buildNextState({
-    now: night,
-    entries: [{ date: '2026-08-09', title: 'New model' }],
-    hash: 'new-hash',
-    previousState: oldState,
-    decision,
-  });
-  assert.equal(pendingState.hash, 'new-hash');
-  assert.equal(pendingState.notifiedHash, 'old-hash');
-
-  const morning = decideNotification({
-    now: new Date('2026-08-09T00:00:00Z'),
-    currentHash: 'new-hash',
-    state: pendingState,
-  });
-  assert.equal(morning.shouldNotify, true);
-  assert.equal(morning.reason, 'change');
-  assert.equal(morning.periodicDue, true);
+test('an update bypasses the nighttime quiet period for both email and WeChat', () => {
+  const now = new Date('2026-08-08T18:05:00Z'); // 02:05 UTC+8
+  for (const channel of [emailChannel, wechatChannel]) {
+    const decision = decideChannelNotification({
+      now,
+      currentHash: 'new-hash',
+      state: oldState,
+      channel,
+      activityDates: ['2026-08-09'],
+    });
+    assert.equal(decision.quiet, true);
+    assert.equal(decision.changedSinceNotification, true);
+    assert.equal(decision.shouldNotify, true);
+  }
 });
 
-test('successful 08:00 notification suppresses repeats until the 10:00 slot', () => {
-  const now = new Date('2026-08-09T00:00:00Z');
-  const decision = decideNotification({ now, currentHash: 'old-hash', state: oldState });
-  const committed = buildNextState({
+test('WeChat stays silent without updates before 18:00', () => {
+  const decision = decideChannelNotification({
+    now: new Date('2026-08-09T02:00:00Z'), // 10:00 UTC+8
+    currentHash: 'old-hash',
+    state: oldState,
+    channel: wechatChannel,
+    activityDates: ['2026-08-09'],
+  });
+  assert.equal(decision.changedSinceNotification, false);
+  assert.equal(decision.summaryDue, false);
+  assert.equal(decision.shouldNotify, false);
+});
+
+test('WeChat sends one daily summary at or after 18:00 and then suppresses repeats', () => {
+  const now = new Date('2026-08-09T10:00:00Z'); // 18:00 UTC+8
+  const decision = decideChannelNotification({
+    now,
+    currentHash: 'old-hash',
+    state: oldState,
+    channel: wechatChannel,
+    activityDates: ['2026-08-09'],
+  });
+  assert.equal(decision.summaryDue, true);
+  assert.deepEqual(decision.summaryDates, ['2026-08-09']);
+  assert.equal(decision.shouldNotify, true);
+
+  const delivery = commitChannelDelivery({
     now,
     entries: oldState.entries,
     hash: 'old-hash',
-    previousState: oldState,
     decision,
-    notificationCommitted: true,
   });
-
-  const sameSlot = decideNotification({
-    now: new Date('2026-08-09T01:30:00Z'),
+  const committedState = { ...oldState, schemaVersion: 3, deliveries: { serverchan: delivery } };
+  const repeated = decideChannelNotification({
+    now: new Date('2026-08-09T11:30:00Z'),
     currentHash: 'old-hash',
-    state: committed,
+    state: committedState,
+    channel: wechatChannel,
+    activityDates: ['2026-08-09'],
   });
-  assert.equal(sameSlot.shouldNotify, false);
-
-  const nextSlot = decideNotification({
-    now: new Date('2026-08-09T02:00:00Z'),
-    currentHash: 'old-hash',
-    state: committed,
-  });
-  assert.equal(nextSlot.shouldNotify, true);
-  assert.equal(nextSlot.reason, 'periodic');
+  assert.equal(repeated.shouldNotify, false);
 });
 
-test('a daytime content change notifies immediately even after the periodic slot', () => {
+test('email retains the two-hour daytime heartbeat policy', () => {
+  const decision = decideChannelNotification({
+    now: new Date('2026-08-09T02:00:00Z'), // 10:00 UTC+8
+    currentHash: 'old-hash',
+    state: oldState,
+    channel: emailChannel,
+  });
+  assert.equal(decision.periodicDue, true);
+  assert.equal(decision.shouldNotify, true);
+});
+
+test('email and WeChat keep independent update delivery state', () => {
   const state = {
     ...oldState,
-    schemaVersion: 2,
-    notifiedEntries: oldState.entries,
-    notifiedHash: 'old-hash',
-    notifiedAt: oldState.checkedAt,
-    lastPeriodicSlot: '2026-08-09T10:00:00+08:00',
+    schemaVersion: 3,
+    deliveries: {
+      smtp: {
+        notifiedEntries: [{ date: '2026-08-09', title: 'New model' }],
+        notifiedHash: 'new-hash',
+        notifiedAt: '2026-08-08T18:05:00.000Z',
+      },
+      serverchan: {
+        notifiedEntries: oldState.entries,
+        notifiedHash: 'old-hash',
+        notifiedAt: oldState.checkedAt,
+      },
+    },
   };
-  const decision = decideNotification({
-    now: new Date('2026-08-09T02:35:00Z'),
+  const now = new Date('2026-08-08T18:10:00Z');
+  const email = decideChannelNotification({ now, currentHash: 'new-hash', state, channel: emailChannel });
+  const wechat = decideChannelNotification({ now, currentHash: 'new-hash', state, channel: wechatChannel });
+  assert.equal(email.shouldNotify, false);
+  assert.equal(wechat.shouldNotify, true);
+  assert.equal(wechat.changedSinceNotification, true);
+});
+
+test('a change detected at 18:00 combines immediate WeChat update and daily summary', () => {
+  const decision = decideChannelNotification({
+    now: new Date('2026-08-09T10:00:00Z'),
     currentHash: 'new-hash',
-    state,
+    state: oldState,
+    channel: wechatChannel,
+    activityDates: ['2026-08-09'],
   });
-  assert.equal(decision.periodicDue, false);
   assert.equal(decision.changedSinceNotification, true);
+  assert.equal(decision.summaryDue, true);
   assert.equal(decision.shouldNotify, true);
+});
+
+test('schema v2 migration treats today old periodic WeChat status as today summary', () => {
+  const state = { ...oldState, lastPeriodicSlot: '2026-08-09T22:00:00+08:00' };
+  const delivery = getChannelDelivery(state, wechatChannel);
+  assert.equal(delivery.lastDailySummaryDate, '2026-08-09');
 });
