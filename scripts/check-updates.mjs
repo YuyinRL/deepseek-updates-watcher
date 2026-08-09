@@ -6,9 +6,9 @@
  * 工作流程：
  *   1. 抓取更新日志页面 HTML（带重试与超时）
  *   2. 用 parseUpdates() 解析出全部更新条目
- *   3. 读取本地状态文件 last-update.json 与本次结果对比
- *   4. 发现新条目（或首次运行）时，通过已配置的通知渠道推送
- *   5. 有变化时写入状态文件，并向 GitHub Actions 输出 has_changes / new_release
+ *   3. 读取状态文件，分别对比「最近检测」与「最近已通知」快照
+ *   4. 按 UTC+8 静默期、变化即时通知和两小时状态通知规则作出决策
+ *   5. 原子写入状态，并在通知失败时保留待通知变化供下一轮重试
  *
  * 支持的通知渠道（均为可选项，未配置相关环境变量即自动跳过）：
  *   SMTP 邮件 / Server酱 / PushPlus / Telegram / Discord / Slack / ntfy / Bark
@@ -16,12 +16,13 @@
  * 除 nodemailer（仅 SMTP 用）外不依赖任何第三方包，全部使用 Node 内置能力。
  */
 
-import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { parseUpdates } from './parse-updates.mjs';
+import { buildNextState, decideNotification } from './notification-policy.mjs';
 
 // ---------------------------------------------------------------------------
 // 环境配置与常量
@@ -55,11 +56,6 @@ const BODY_TRUNCATE = 700;
 const BARK_BODY_TRUNCATE = 300;
 // Discord 单条消息上限 2000 字符
 const DISCORD_MAX_LENGTH = 2000;
-
-// 心跳保活：GitHub 公共仓库的定时工作流在「60 天无仓库活动」后会被自动停用，
-// 因此页面超过 25 天无更新时，提交一次状态文件作为保活（不触发任何通知，不消耗通知配额）。
-const KEEPALIVE_DAYS = 25;
-const KEEPALIVE_MS = KEEPALIVE_DAYS * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // 小工具函数
@@ -144,14 +140,16 @@ function computeHash(metaEntries) {
   return createHash('sha256').update(JSON.stringify(metaEntries)).digest('hex');
 }
 
-// 写入新状态快照 { checkedAt, entries, hash }；checkedAt 同时充当「上次写入/保活时间」
-function writeState(file, entries, hash) {
-  const state = {
-    checkedAt: new Date().toISOString(),
-    entries,
-    hash,
-  };
-  writeFileSync(file, JSON.stringify(state, null, 2) + '\n', 'utf8');
+// 原子写入状态：断电或进程被终止时，旧状态文件不会被写到一半。
+function writeState(file, state) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporaryFile = `${file}.${process.pid}.tmp`;
+  try {
+    writeFileSync(temporaryFile, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    renameSync(temporaryFile, file);
+  } finally {
+    rmSync(temporaryFile, { force: true });
+  }
 }
 
 // 向 GitHub Actions 输出文件追加键值对（steps.<id>.outputs.X 由此而来）
@@ -241,6 +239,33 @@ function buildStartupHtml(entries, pageUrl) {
     <p>已记录 ${entries.length} 条历史更新日志。</p>
     <p>最近一条：${escapeHtml(latest.date)} — ${escapeHtml(latest.title)}</p>
     <p>之后将定时检查该页面，发现新条目会立即推送通知。</p>
+    <p><a href="${escapeHtml(pageUrl)}">打开更新日志页面 →</a></p>
+  </div>`;
+}
+
+function buildPeriodicText(entries, pageUrl, checkedAt) {
+  const latest = entries[0] ?? { date: '未知', title: '无' };
+  return [
+    'DeepSeek API 更新日志定时状态：暂无新变化。',
+    '',
+    `本次检测时间：${checkedAt}（UTC+8）`,
+    `当前记录：${entries.length} 条`,
+    `最近一条：${latest.date} | ${latest.title}`,
+    '',
+    '监控仍在运行，每 5 分钟检测一次。',
+    `页面链接：${pageUrl}`,
+  ].join('\n');
+}
+
+function buildPeriodicHtml(entries, pageUrl, checkedAt) {
+  const latest = entries[0] ?? { date: '未知', title: '无' };
+  return `
+  <div style="font-family:-apple-system,'Segoe UI',Roboto,'Microsoft YaHei',sans-serif;max-width:640px;margin:0 auto;color:#222;">
+    <h2>DeepSeek API 更新日志定时状态</h2>
+    <p>暂无新变化，监控仍在运行。</p>
+    <p>本次检测时间：${escapeHtml(checkedAt)}（UTC+8）</p>
+    <p>当前记录：${entries.length} 条</p>
+    <p>最近一条：${escapeHtml(latest.date)} — ${escapeHtml(latest.title)}</p>
     <p><a href="${escapeHtml(pageUrl)}">打开更新日志页面 →</a></p>
   </div>`;
 }
@@ -398,7 +423,7 @@ async function sendAllChannels(configuredChannels, payload) {
 // 主流程
 // ---------------------------------------------------------------------------
 
-async function main() {
+export async function runCheck({ now } = {}) {
   log('DeepSeek API 更新日志监控启动');
   log(`页面：${PAGE_URL}`);
   log(`状态文件：${STATE_FILE}${DRY_RUN ? '（DRY_RUN 演练模式：不发送通知、不写状态、不输出 GITHUB_OUTPUT）' : ''}`);
@@ -409,8 +434,14 @@ async function main() {
 
   // 2. 解析更新条目
   const entries = parseUpdates(html);
+  if (entries.length === 0) {
+    throw new Error('页面解析结果为空，拒绝更新状态；目标页面结构可能已经变化');
+  }
   const latest = entries[0];
   log(`解析到 ${entries.length} 条更新日志${latest ? `，最新：${latest.date} | ${latest.title}` : ''}`);
+
+  // 默认以抓取和解析完成后的时刻作出通知决策；测试可显式注入固定时间。
+  const checkedAt = now ?? new Date();
 
   // 3. 加载状态文件（缺失/损坏 → 首次运行）
   const state = loadState(STATE_FILE);
@@ -423,95 +454,117 @@ async function main() {
   // 兼容旧版状态文件（有 entries 但无 hash 字段）：用旧 entries 现算一个 hash 做迁移比对
   const oldHash = state?.hash ?? (state?.entries?.length ? computeHash(state.entries) : null);
   const changed = newHash !== oldHash;
-  const oldKeys = new Set((state?.entries ?? []).map((e) => `${e.date}|${e.title}`));
+  const decision = decideNotification({ now: checkedAt, currentHash: newHash, state });
+  const oldKeys = new Set(decision.notified.entries.map((e) => `${e.date}|${e.title}`));
   const newItems = entries.filter((e) => !oldKeys.has(`${e.date}|${e.title}`));
-  log(`内容哈希：${newHash.slice(0, 12)}… ${changed ? '（与上次不同 → 有更新）' : '（与上次一致）'}`);
+  log(`内容哈希：${newHash.slice(0, 12)}… ${changed ? '（与上次检测不同）' : '（与上次检测一致）'}`);
+  log(`UTC+8 时间：${decision.localDate} ${decision.localTime}${decision.quiet ? '（静默时段）' : ''}`);
 
-  // 5. 无内容变化：静默退出；但若超过保活周期或旧状态需要迁移，回写一次状态（不通知、不占配额）
-  if (!changed) {
-    // 以 checkedAt（上次写入状态的时间）作为保活计时起点；未记录过则视为刚刚写入
-    const lastChecked = state?.checkedAt ? Date.parse(state.checkedAt) : Date.now();
-    const heartbeatDue = !isFirstRun && (Date.now() - lastChecked) > KEEPALIVE_MS;
-    const needBackfill = !!state && !state.hash; // 旧版状态缺少 hash 字段，回写一次完成迁移
-    if (heartbeatDue || needBackfill) {
-      log(heartbeatDue
-        ? '页面无更新，但超过保活周期，提交一次心跳状态（不发送通知）'
-        : '旧版状态缺少 hash 字段，回写迁移一次（不发送通知）');
-      if (DRY_RUN) {
-        log('DRY_RUN：将回写心跳状态并输出 keepalive=true');
-      } else {
-        writeState(STATE_FILE, newMeta, newHash);
-        appendGithubOutput(['keepalive=true']);
-      }
-      return 0;
+  // 5. 00:00-08:00 仍持续检测并更新 observed snapshot，但绝不发送通知。
+  // notified snapshot 保持不变，因此夜间积累的变化会在 08:00 后补发。
+  if (decision.quiet) {
+    log(decision.changedSinceNotification
+      ? '静默时段检测到尚未通知的变化：已暂存，08:00 后补发'
+      : '静默时段：本次无待通知变化');
+    if (!DRY_RUN) {
+      writeState(STATE_FILE, buildNextState({ now: checkedAt, entries: newMeta, hash: newHash, previousState: state, decision }));
+      appendGithubOutput(['state_changed=true']);
     }
-    log('无更新：页面内容与上次快照一致，跳过通知与状态写入');
+    return 0;
+  }
+
+  // 白天没有变化且当前两小时周期已通知过，只更新健康检查时间。
+  if (!decision.shouldNotify) {
+    log('无更新，且当前两小时通知已发送：跳过通知');
+    if (!DRY_RUN) writeState(STATE_FILE, buildNextState({ now: checkedAt, entries: newMeta, hash: newHash, previousState: state, decision }));
     return 0;
   }
 
   // 6. 模型发布检测，决定标题前缀
-  const isRelease = newItems.some(isModelReleaseItem);
+  const isRelease = decision.changedSinceNotification && newItems.some(isModelReleaseItem);
   const prefix = newItems.length > 0 ? (isRelease ? '🚀 新模型发布：' : '📢 更新日志：') : '📢 更新日志：';
   const subject = buildSubject(prefix, newItems);
-  log(
-    `检测到变化：${newItems.length} 条新条目${isFirstRun ? '（首次运行快照）' : ''}` +
-      `${isRelease ? '，判定为新模型发布' : ''}`
-  );
+  const isFirstNotification = decision.notified.hash === null;
+  log(decision.changedSinceNotification
+    ? `准备发送变化通知：${newItems.length} 条新条目${isFirstNotification ? '（首次通知）' : ''}${isRelease ? '，判定为新模型发布' : ''}`
+    : `当前 ${decision.periodicSlot.id} 两小时状态通知尚未发送`);
 
   // 7. 构建通知内容（首次运行只发"监控已启动"确认消息）
-  const payload = isFirstRun
+  const payload = isFirstNotification
     ? { subject: '🚀 DeepSeek API 更新日志监控已启动', text: buildStartupText(entries, PAGE_URL), html: buildStartupHtml(entries, PAGE_URL) }
-    : { subject, text: buildNotificationText(newItems, PAGE_URL), html: buildNotificationHtml(newItems, PAGE_URL) };
+    : decision.changedSinceNotification
+      ? { subject, text: buildNotificationText(newItems, PAGE_URL), html: buildNotificationHtml(newItems, PAGE_URL) }
+      : {
+          subject: 'DeepSeek API 更新日志：定时状态正常',
+          text: buildPeriodicText(entries, PAGE_URL, `${decision.localDate} ${decision.localTime}`),
+          html: buildPeriodicHtml(entries, PAGE_URL, `${decision.localDate} ${decision.localTime}`),
+        };
   // 已配置的渠道：所需环境变量全部非空（GitHub Actions 中未填写的 Secret 为空字符串，同样视为未配置）
   const configuredChannels = CHANNELS.filter((c) => c.envVars.every((v) => env[v]));
 
   // 8. DRY_RUN：仅打印"将要发生什么"，不产生任何副作用
   if (DRY_RUN) {
-    log(`DRY_RUN：${isFirstRun ? '将发送『监控已启动』确认消息' : '将发送更新通知'}（标题：${payload.subject}）`);
+    log(`DRY_RUN：将发送${decision.changedSinceNotification ? '变化' : '两小时状态'}通知（标题：${payload.subject}）`);
     log(`DRY_RUN：共 ${configuredChannels.length} 个渠道已配置，实际不发送`);
     for (const ch of configuredChannels) {
       log(`DRY_RUN：  渠道 ${ch.name}（env: ${ch.envVars.join(', ')}）`);
     }
-    log(`DRY_RUN：将写入状态文件（${newMeta.length} 条快照）`);
-    log(`DRY_RUN：将追加 GITHUB_OUTPUT → has_changes=true, new_release=${isRelease}`);
+    log(`DRY_RUN：将写入 schemaVersion=2 状态文件（${newMeta.length} 条快照）`);
     log('DRY_RUN 结束：未发送任何通知、未写入状态文件');
     return 0;
   }
 
   // 9. 发送通知：首次运行且关闭确认消息时跳过
-  if (isFirstRun && !NOTIFY_ON_FIRST_RUN) {
+  let notificationCommitted = false;
+  let exitCode = 0;
+  if (isFirstNotification && !NOTIFY_ON_FIRST_RUN) {
     log('首次运行，且 NOTIFY_ON_FIRST_RUN=false，跳过通知发送');
+    notificationCommitted = true;
   } else {
     const { configured, ok } = await sendAllChannels(configuredChannels, payload);
 
     if (configured === 0) {
-      // 没有任何渠道被配置：仅警告，不视为失败（状态提交照常进行）
+      // 没有渠道时保留待通知状态并返回失败，常驻运行器会在下一周期重试。
       warn('未配置任何通知渠道。可配置的渠道及所需环境变量：');
       for (const ch of CHANNELS) warn(`  ${ch.name}：${ch.envVars.join('、')}`);
-      warn('参考 README.md 在仓库 Settings → Secrets 中配置后即可收到通知；本次仍会提交状态快照。');
+      warn('请在 .env 中配置至少一个通知渠道；本次不会把待通知变化标记为已发送。');
+      exitCode = 1;
     } else if (ok === 0) {
-      // 有渠道配置但全部发送失败：返回非零，让 GitHub 也能收到"失败"邮件
       error(`已配置 ${configured} 个渠道但全部发送失败`);
-      writeState(STATE_FILE, newMeta, newHash);
-      appendGithubOutput([`has_changes=true`, `new_release=${isRelease}`]);
-      return 1;
+      exitCode = 1;
+    } else {
+      notificationCommitted = true;
+      if (ok < configured) warn(`${configured} 个已配置渠道中有 ${configured - ok} 个发送失败`);
     }
   }
 
-  // 10. 写入新状态快照 + 输出 GitHub Actions 变量
-  writeState(STATE_FILE, newMeta, newHash);
-  appendGithubOutput([`has_changes=true`, `new_release=${isRelease}`]);
-  log('状态文件已更新');
-  if (env.GITHUB_OUTPUT) log(`GITHUB_OUTPUT 已写入 has_changes=true, new_release=${isRelease}`);
+  // 10. 无论发送成功与否都保存观察快照；只有成功时才推进 notified snapshot。
+  writeState(STATE_FILE, buildNextState({
+    now: checkedAt,
+    entries: newMeta,
+    hash: newHash,
+    previousState: state,
+    decision,
+    notificationCommitted,
+  }));
+  appendGithubOutput([
+    'state_changed=true',
+    `has_changes=${decision.changedSinceNotification}`,
+    `new_release=${isRelease}`,
+  ]);
+  log(notificationCommitted ? '状态已更新，通知已确认' : '观察状态已更新，待通知状态保留以便下次重试');
 
-  return 0;
+  return exitCode;
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((err) => {
-    error(`执行失败：${err.message}`);
-    process.exitCode = 1;
-  });
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  runCheck()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((err) => {
+      error(`执行失败：${err.message}`);
+      process.exitCode = 1;
+    });
+}

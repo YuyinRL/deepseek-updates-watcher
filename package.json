@@ -9,6 +9,8 @@
   },
   "scripts": {
     "check": "node scripts/check-updates.mjs",
+    "watch": "node scripts/watch.mjs",
+    "test": "node --test test/*.test.mjs && node test/verify_fixture.mjs",
     "verify:fixture": "node test/verify_fixture.mjs"
   },
   "dependencies": {

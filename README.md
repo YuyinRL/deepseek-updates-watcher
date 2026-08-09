@@ -1,153 +1,100 @@
-# DeepSeek API 更新日志监控（deepseek-updates-watcher）
+# DeepSeek API 更新日志监控
 
-一个基于 GitHub Actions 的定时监控项目：每 5 分钟抓取
-[DeepSeek API 更新日志](https://api-docs.deepseek.com/zh-cn/updates) 页面，通过 **SHA-256 哈希比对**检测页面是否出现**新的更新条目**（尤其是**新模型发布**），有变化时通过邮件 / Server酱 / PushPlus / Telegram / Discord / Slack / ntfy / Bark 等渠道推送通知，并把最新状态快照自动提交回仓库。
+一个常驻在本地 Homelab 的 DeepSeek API 更新日志监控服务。服务每 5 分钟抓取一次
+[DeepSeek API 更新日志](https://api-docs.deepseek.com/zh-cn/updates)，通过 SHA-256
+比较日期和标题，并通过邮件、Server酱、PushPlus 等渠道发送变化通知和定时状态。
 
-## 项目简介
+## 当前通知规则
 
-DeepSeek 的更新日志是静态 Docusaurus 页面，没有公开的 RSS / API 接口。本项目用 Node.js 脚本每 5 分钟抓取该页面、计算内容哈希并与上次的哈希比对，从而实现"有新内容第一时间通知你"的效果：
+所有时间固定使用东八区（UTC+8）：
 
-- 🕐 **每 5 分钟自动检查**（GitHub Actions 支持的最短间隔，可自定义）
-- 🔒 **哈希比对**：只对全部条目的「日期+标题」计算 SHA-256，正文微调不会触发通知（省通知配额）
-- 🚀 **识别新模型发布**（如 `DeepSeek-V4-Flash`），标题显示为"🚀 新模型发布："
-- 📢 其他更新显示为"📢 更新日志："
-- 📧 邮件 + 7 种主流即时通讯渠道，任意组合
-- 💾 状态文件 `last-update.json` 即"记忆"，无外部数据库
-- ❤️ **心跳保活**：超过 25 天无更新时自动提交一次状态（不发通知），防止定时工作流因仓库 60 天无活动被 GitHub 停用
+- `00:00 <= 时间 < 08:00`：继续每 5 分钟检测，但不发送任何通知。
+- 夜间检测到的变化会保存在状态文件中，08:00 后补发，不会因为静默而丢失。
+- `08:00、10:00、12:00、14:00、16:00、18:00、20:00、22:00`：发送一次状态通知，即使没有变化也会发送。
+- `08:00-24:00` 检测到变化：不等待下一个两小时整点，立即发送。
+- 如果变化通知恰好发生在一个尚未发送的两小时窗口，它同时算作该窗口的状态通知，不会连续发送两封。
+- 服务停机后恢复时，只补当前窗口的一次状态，不会把错过的所有心跳集中补发。
 
-## 工作原理
+检测周期和通知周期相互独立：页面仍然每 5 分钟检测，两小时只是无变化时的主动报平安周期。
 
-```
-定时触发 GitHub Actions（每 5 分钟）
-        │
-        ▼
-抓取 https://api-docs.deepseek.com/zh-cn/updates  HTML
-        │
-        ▼
-parseUpdates() 按 <h2> 块正则解析出 [{date, title, body}]
-        │
-        ▼
-计算内容哈希 SHA-256(全部条目日期+标题)
-        │
-   ┌────┴─────┐
-   ▼          ▼
- 哈希变化    哈希不变
-   │         └──── 超过 25 天？→ 心跳提交状态（不通知）
-   ▼
-向已配置的通知渠道推送（新模型发布 → 🚀 前缀）
-   │
-   ▼
-写入新快照 last-update.json（含新哈希），提交并推送回 GitHub
+## 状态与可靠性
+
+状态保存在 `/data/state.json`，包含两套快照：
+
+- `entries` / `hash`：最近一次检测到的页面内容。
+- `notifiedEntries` / `notifiedHash`：最近一次已经成功通知的内容。
+
+这套拆分可以保证夜间继续检测时不会吞掉变化。状态通过临时文件加原子重命名写入，断电或进程被终止时不会留下只写了一半的 JSON。
+
+容器使用 `restart: unless-stopped` 自动恢复；健康检查要求最近一次成功抓取不能早于 15 分钟前。通知全部失败时不会推进已通知快照，下一轮检测会继续重试。
+
+## 本地 Docker 部署
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少配置一个通知渠道
+docker compose build
+docker compose up -d
+docker compose logs -f --tail 100
 ```
 
-状态文件是项目的"记忆"：首次运行记录全量快照并发送一条确认消息；之后只有哈希变化才推送**新增**的条目，同一变化只通知一次，绝不重复轰炸。检测到变化时仓库里会留下一次 commit（如 `chore: update DeepSeek changelog snapshot`），也是一份历史审计记录。
+服务器上的默认目录：
 
-## 目录结构
-
-```
-deepseek-updates-watcher/
-├── .github/workflows/
-│   └── check-updates.yml    # GitHub Actions 工作流（定时 + 手动触发）
-├── scripts/
-│   ├── parse-updates.mjs    # HTML 解析模块（纯正则，无第三方库）
-│   └── check-updates.mjs    # 主脚本：抓取→解析→比对→通知→写状态
-├── test/
-│   ├── fixtures/updates.html    # 真实抓取的页面快照（勿修改）
-│   └── verify_fixture.mjs       # 用快照验证解析逻辑的测试
-├── last-update.json         # 状态快照（监控的"记忆"，自动提交）
-├── package.json             # 依赖与脚本（仅 nodemailer）
-└── .gitignore
+```text
+C:\srv\stacks\deepseek-updates-watcher       项目和 compose.yaml
+C:\srv\appdata\deepseek-updates-watcher     持久化状态
 ```
 
-## 快速开始
+容器不开放任何入站端口，只需要出站访问监控页面、SMTP 和已启用的通知服务。
 
-1. **新建仓库**：在 GitHub 上创建一个仓库（可设为 Private）。
+常用运维命令：
 
-2. **本地初始化**（可选，也可直接在 GitHub 网页上"上传文件"）：
-   ```powershell
-   cd deepseek-updates-watcher
-   git init
-   git add .
-   git commit -m "init: deepseek updates watcher"
-   git branch -M main
-   git remote add origin git@github.com:<你的用户名>/<仓库名>.git
-   git push -u origin main
-   ```
-
-3. **添加 Secrets**：进入仓库
-   `Settings → Secrets and variables → Actions → New repository secret`，
-   按下面的"通知渠道配置表"添加你要用的渠道密钥。**不填任何 Secret 也能运行**（只是收不到通知），脚本会打印警告但照常提交状态快照。
-
-4. **手动触发一次**：`Actions` 页 → 选中 **Watch DeepSeek API Updates** → **Run workflow**，验证一切正常。
-
-## 通知渠道配置表
-
-每个渠道为**可选项**，在仓库 Secrets 中配置对应密钥即启用；不配置自动跳过。
-
-| 渠道 | 所需 Secrets | 说明 |
-| ---- | ------------ | ---- |
-| SMTP 邮件 | `SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`；可选 `SMTP_PORT`（默认 587）、`SMTP_SECURE`（`true` 表示 465 SSL）、`SMTP_FROM`（默认用 `SMTP_USER`） | 发送 HTML 邮件。`MAIL_TO` 支持逗号分隔多个收件人。**注意：QQ 邮箱 / Gmail 需使用"授权码"而非登录密码**（QQ 邮箱在"设置→账户→开启 SMTP 服务"获取；Gmail 需开启两步验证后生成应用专用密码） |
-| Server酱 | `SERVERCHAN_SENDKEY` | [Server酱 Turbo](https://sct.ftqq.com) 微信推送，表单 POST 到 `sctapi.ftqq.com/{key}.send` |
-| PushPlus | `PUSHPLUS_TOKEN` | [PushPlus](https://www.pushplus.plus) 微信推送，JSON + markdown 模板 |
-| Telegram | `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` | 通过 BotFather 创建 Bot 获得 token；chat_id 为接收者的数字 ID（可与机器人 @userinfobot 获取） |
-| Discord | `DISCORD_WEBHOOK` | 频道设置 → 集成 → Webhook 的完整 URL，正文自动截断至 2000 字符 |
-| Slack | `SLACK_WEBHOOK` | Incoming Webhook 的完整 URL，消息体为 `{ text }` |
-| ntfy | `NTFY_TOPIC`；可选 `NTFY_SERVER` | 默认 POST 到 `https://ntfy.sh/{topic}`；`NTFY_SERVER` 可指向自建 ntfy 服务器 |
-| Bark | `BARK_KEY` | iOS 推送，GET 请求，正文自动截断至约 300 字符以控制 URL 长度 |
-
-## 首次运行
-
-部署后第一次运行时，若状态文件为空，脚本会记录全量快照并发送一条 **"监控已启动"** 确认消息（提示你渠道配置正确、能收到通知）。之后只有哈希变化（出现新条目）才推送。
-
-> 不需要首次确认消息？在 Secrets 中添加 `NOTIFY_ON_FIRST_RUN` 并设为 `false`。
-
-## 通知配额说明（重要）
-
-部分渠道有每日条数限制（例如 **Server酱 免费版每天 5 条**）。本项目天然省配额：
-
-- **只有哈希变化才发通知**——页面无更新时静默退出，0 消耗；
-- **同一变化只通知一次**——状态文件已记录哈希，下次运行对比一致即不再发；
-- **首次确认消息可关闭**——`NOTIFY_ON_FIRST_RUN=false`；
-- **心跳提交不通知**——保活 commit 不经过任何通知渠道。
-
-如果某一天 DeepSeek 连续发布多条更新，通知条数等于实际更新条数（真实消耗，非浪费）。
-
-## 测试
-
-- **手动触发**：仓库 `Actions` 页 → **Watch DeepSeek API Updates** → 右侧 **Run workflow** → 运行按钮。
-- **本地解析测试**：
-  ```powershell
-  npm run verify:fixture
-  ```
-  用 `test/fixtures/updates.html`（真实抓取的 18 条快照）校验解析逻辑。
-
-## 自定义
-
-- **检查频率**：修改 `.github/workflows/check-updates.yml` 中 `schedule.cron`。`*/5 * * * *` = 每 5 分钟（GitHub Actions 支持的最短间隔）；`0 * * * *` = 每小时整点。（注意：GitHub Actions 的 cron 使用 **UTC 时间**；调度在高负载时段（每小时整点）可能延迟几分钟，属正常现象；公共仓库的定时工作流在 60 天无仓库活动后会被自动停用——本项目的心跳保活机制（默认 25 天）会自动提交状态来防止这一点）
-- **监控其他页面**：`PAGE_URL` 默认指向中文更新日志页，可通过 Secret `PAGE_URL` 覆盖（页面结构需一致）。
-- **本地调试**：见下节。
-
-## 本地调试
-
-```powershell
-npm install
-$env:DRY_RUN = 'true'   # 演练模式：抓取 + 解析 + 比对，但不发送通知、不写状态文件
-node scripts/check-updates.mjs
+```bash
+cd /mnt/c/srv/stacks/deepseek-updates-watcher
+docker compose ps
+docker compose logs --tail 100
+docker compose restart
+docker inspect --format '{{.State.Health.Status}}' deepseek-updates-watcher
 ```
 
-DRY_RUN 模式会打印解析结果、变化检测结果、将发送给哪些渠道、将写入的状态内容，**不会产生任何副作用**。想验证真实推送，可临时在 PowerShell 中 `$env:SERVERCHAN_SENDKEY = '...'` 等设置后，去掉 `DRY_RUN` 运行——但请留意状态文件会被写入。
+## 配置
 
-## 兜底
+所有密钥只放在 `.env`，该文件已经被 `.gitignore` 排除。
 
-脚本设计上**不会静默失败**：
+| 渠道 | 环境变量 | 说明 |
+| --- | --- | --- |
+| SMTP 邮件 | `SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO` | 可选 `SMTP_PORT`、`SMTP_SECURE`、`SMTP_FROM` |
+| Server酱 | `SERVERCHAN_SENDKEY` | 微信推送 |
+| PushPlus | `PUSHPLUS_TOKEN` | 微信推送 |
+| Telegram | `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` | Bot 消息 |
+| Discord | `DISCORD_WEBHOOK` | Webhook 消息 |
+| Slack | `SLACK_WEBHOOK` | Incoming Webhook |
+| ntfy | `NTFY_TOPIC` | 可选 `NTFY_SERVER`，默认 `https://ntfy.sh` |
+| Bark | `BARK_KEY` | iOS 推送 |
 
-- 页面抓取连续 3 次失败 → 脚本以非零码退出；
-- 所有已配置渠道发送均失败 → 脚本以非零码退出；
-- 这些情况下 GitHub Actions 会直接标记任务失败。建议在 GitHub 的 `Settings → Notifications` 里开启 **Actions** 相关失败邮件通知，即可在"监控脚本自身出问题"时也收到提醒。
+其他配置：
 
-## 注意事项
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PAGE_URL` | DeepSeek 中文更新日志 | 被监控页面 |
+| `CHECK_INTERVAL_SECONDS` | `300` | 检测周期，最小 60 秒 |
+| `NOTIFY_ON_FIRST_RUN` | `true` | 无历史状态时是否发送启动通知 |
+| `STATE_FILE` | `/data/state.json` | 容器内状态路径 |
 
-- **自动推送**：`check-updates.yml` 使用默认的 `GITHUB_TOKEN`，权限 `contents: write`，提交与推送均为自动完成，无需额外配置 PAT。
-- **不会无限循环**：GitHub 规定从 Actions 内部触发的 commit **不会**重新触发同仓库的 `workflow_dispatch` / `schedule` 工作流，因此本项目的状态提交不会引起自我触发，无循环风险。
-- **状态文件会被提交**：`last-update.json` 作为监控记忆需要入库，请勿加入 `.gitignore`。
-- **渠道密钥只存 Secrets**：本地测试密钥请放 `.env` 文件（已在 `.gitignore` 中忽略），切勿提交。
+GitHub Actions Secrets 无法被读取或导出，因此从 Actions 迁移到本地时，需要把对应通知凭据重新填写到服务器 `.env`。
+
+## 测试与演练
+
+```bash
+npm ci
+npm test
+
+# 抓取真实页面并显示本次决策，不发送、不写状态
+DRY_RUN=true npm run check
+```
+
+`npm test` 覆盖解析器和以下调度边界：静默起止时间、两小时固定窗口、夜间变化积压、08:00 补发、窗口内去重以及白天变化即时通知。
+
+## GitHub Actions
+
+定时调度已经从工作流中移除，避免本地容器和 GitHub 重复通知。工作流仍保留 `workflow_dispatch`，用于手动故障排查。状态迁移完成后，本地容器不会再向仓库自动提交 `last-update.json`。
