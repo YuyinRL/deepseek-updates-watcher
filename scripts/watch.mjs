@@ -21,6 +21,28 @@ function requestStop(signal) {
   stopController.abort();
 }
 
+async function waitForNextCheck() {
+  const notBefore = Date.now() + intervalMs;
+  let remaining = intervalMs;
+  log(`next check in ${intervalSeconds}s (not before ${new Date(notBefore).toISOString()})`);
+
+  while (!stopping && remaining > 0) {
+    try {
+      await sleep(remaining, undefined, { signal: stopController.signal });
+    } catch (err) {
+      if (err.name !== 'AbortError') throw err;
+      return;
+    }
+
+    // Windows/WSL can correct its wall clock while the monotonic timer is
+    // sleeping. If it moved backwards, wait the missing wall-clock time too.
+    remaining = notBefore - Date.now();
+    if (remaining > 0) {
+      log(`system clock moved backwards; extending wait by ${Math.ceil(remaining / 1000)}s`);
+    }
+  }
+}
+
 process.once('SIGTERM', () => requestStop('SIGTERM'));
 process.once('SIGINT', () => requestStop('SIGINT'));
 
@@ -36,14 +58,9 @@ while (!stopping) {
 
   if (stopping) break;
 
-  // Run immediately on startup, then align checks to wall-clock interval boundaries.
-  const delay = intervalMs - (Date.now() % intervalMs);
-  log(`next check in ${Math.ceil(delay / 1000)}s`);
-  try {
-    await sleep(delay, undefined, { signal: stopController.signal });
-  } catch (err) {
-    if (err.name !== 'AbortError') throw err;
-  }
+  // Run immediately on startup, then wait a full interval after every completed
+  // check. This guarantees that two checks never start only a few seconds apart.
+  await waitForNextCheck();
 }
 
 log('watcher stopped');
