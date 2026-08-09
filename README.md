@@ -1,22 +1,24 @@
 # DeepSeek API 更新日志监控（deepseek-updates-watcher）
 
-一个基于 GitHub Actions 的定时监控项目：每小时抓取
-[DeepSeek API 更新日志](https://api-docs.deepseek.com/zh-cn/updates) 页面，检测到**新的更新条目**（尤其是**新模型发布**）时，通过邮件 / Server酱 / PushPlus / Telegram / Discord / Slack / ntfy / Bark 等渠道推送通知，并把最新状态快照自动提交回仓库。
+一个基于 GitHub Actions 的定时监控项目：每 5 分钟抓取
+[DeepSeek API 更新日志](https://api-docs.deepseek.com/zh-cn/updates) 页面，通过 **SHA-256 哈希比对**检测页面是否出现**新的更新条目**（尤其是**新模型发布**），有变化时通过邮件 / Server酱 / PushPlus / Telegram / Discord / Slack / ntfy / Bark 等渠道推送通知，并把最新状态快照自动提交回仓库。
 
 ## 项目简介
 
-DeepSeek 的更新日志是静态 Docusaurus 页面，没有公开的 RSS / API 接口。本项目用 Node.js 脚本定期抓取该页面、解析条目并与上次的快照比对，从而实现"有新内容立刻通知你"的效果：
+DeepSeek 的更新日志是静态 Docusaurus 页面，没有公开的 RSS / API 接口。本项目用 Node.js 脚本每 5 分钟抓取该页面、计算内容哈希并与上次的哈希比对，从而实现"有新内容第一时间通知你"的效果：
 
-- 🕐 **每小时自动检查**（可自定义 cron）
+- 🕐 **每 5 分钟自动检查**（GitHub Actions 支持的最短间隔，可自定义）
+- 🔒 **哈希比对**：只对全部条目的「日期+标题」计算 SHA-256，正文微调不会触发通知（省通知配额）
 - 🚀 **识别新模型发布**（如 `DeepSeek-V4-Flash`），标题显示为"🚀 新模型发布："
 - 📢 其他更新显示为"📢 更新日志："
 - 📧 邮件 + 7 种主流即时通讯渠道，任意组合
 - 💾 状态文件 `last-update.json` 即"记忆"，无外部数据库
+- ❤️ **心跳保活**：超过 25 天无更新时自动提交一次状态（不发通知），防止定时工作流因仓库 60 天无活动被 GitHub 停用
 
 ## 工作原理
 
 ```
-定时触发 GitHub Actions
+定时触发 GitHub Actions（每 5 分钟）
         │
         ▼
 抓取 https://api-docs.deepseek.com/zh-cn/updates  HTML
@@ -25,20 +27,20 @@ DeepSeek 的更新日志是静态 Docusaurus 页面，没有公开的 RSS / API 
 parseUpdates() 按 <h2> 块正则解析出 [{date, title, body}]
         │
         ▼
-与状态文件 last-update.json 中上次的 [{date, title}] 快照对比
+计算内容哈希 SHA-256(全部条目日期+标题)
         │
    ┌────┴─────┐
    ▼          ▼
- 有变化      无变化 → 静默退出
-   │
+ 哈希变化    哈希不变
+   │         └──── 超过 25 天？→ 心跳提交状态（不通知）
    ▼
 向已配置的通知渠道推送（新模型发布 → 🚀 前缀）
    │
    ▼
-写入新快照 last-update.json，提交并推送回 GitHub
+写入新快照 last-update.json（含新哈希），提交并推送回 GitHub
 ```
 
-状态文件是项目的"记忆"：首次运行记录全量快照，之后每次只推送**新增**的条目，所以不会重复轰炸。检测到变化时仓库里会留下一次 commit（如 `chore: update DeepSeek changelog snapshot`），也是一份历史审计记录。
+状态文件是项目的"记忆"：首次运行记录全量快照并发送一条确认消息；之后只有哈希变化才推送**新增**的条目，同一变化只通知一次，绝不重复轰炸。检测到变化时仓库里会留下一次 commit（如 `chore: update DeepSeek changelog snapshot`），也是一份历史审计记录。
 
 ## 目录结构
 
@@ -95,9 +97,20 @@ deepseek-updates-watcher/
 
 ## 首次运行
 
-部署后第一次运行时，若状态文件为空，脚本会记录全量快照并发送一条 **"监控已启动"** 确认消息（提示你渠道配置正确、能收到通知）。之后只推送新增条目。
+部署后第一次运行时，若状态文件为空，脚本会记录全量快照并发送一条 **"监控已启动"** 确认消息（提示你渠道配置正确、能收到通知）。之后只有哈希变化（出现新条目）才推送。
 
 > 不需要首次确认消息？在 Secrets 中添加 `NOTIFY_ON_FIRST_RUN` 并设为 `false`。
+
+## 通知配额说明（重要）
+
+部分渠道有每日条数限制（例如 **Server酱 免费版每天 5 条**）。本项目天然省配额：
+
+- **只有哈希变化才发通知**——页面无更新时静默退出，0 消耗；
+- **同一变化只通知一次**——状态文件已记录哈希，下次运行对比一致即不再发；
+- **首次确认消息可关闭**——`NOTIFY_ON_FIRST_RUN=false`；
+- **心跳提交不通知**——保活 commit 不经过任何通知渠道。
+
+如果某一天 DeepSeek 连续发布多条更新，通知条数等于实际更新条数（真实消耗，非浪费）。
 
 ## 测试
 
@@ -110,7 +123,7 @@ deepseek-updates-watcher/
 
 ## 自定义
 
-- **检查频率**：修改 `.github/workflows/check-updates.yml` 中 `schedule.cron`。`0 * * * *` = 每小时整点；`*/30 * * * *` = 每 30 分钟。（注意：GitHub Actions 的 cron 使用 **UTC 时间**；调度在高负载时段（每小时整点）可能延迟几分钟，属正常现象；公共仓库的定时工作流在 60 天无仓库活动后会被自动禁用，需手动重新启用）
+- **检查频率**：修改 `.github/workflows/check-updates.yml` 中 `schedule.cron`。`*/5 * * * *` = 每 5 分钟（GitHub Actions 支持的最短间隔）；`0 * * * *` = 每小时整点。（注意：GitHub Actions 的 cron 使用 **UTC 时间**；调度在高负载时段（每小时整点）可能延迟几分钟，属正常现象；公共仓库的定时工作流在 60 天无仓库活动后会被自动停用——本项目的心跳保活机制（默认 25 天）会自动提交状态来防止这一点）
 - **监控其他页面**：`PAGE_URL` 默认指向中文更新日志页，可通过 Secret `PAGE_URL` 覆盖（页面结构需一致）。
 - **本地调试**：见下节。
 

@@ -2,8 +2,8 @@ name: Watch DeepSeek API Updates
 
 on:
   schedule:
-    # 每小时运行一次（UTC 时间，GitHub Actions 的 cron 使用 UTC）
-    - cron: '0 * * * *'
+    # 每 5 分钟运行一次（GitHub Actions 支持的最短间隔；UTC 时间）
+    - cron: '*/5 * * * *'
   workflow_dispatch: # 支持在 Actions 页面手动触发
 
 permissions:
@@ -58,7 +58,8 @@ jobs:
           BARK_KEY: ${{ secrets.BARK_KEY }}
 
       - name: 提交状态快照
-        if: steps.check.outputs.has_changes == 'true'
+        # 内容有更新（has_changes）或保活/迁移回写（keepalive）时提交
+        if: steps.check.outputs.has_changes == 'true' || steps.check.outputs.keepalive == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

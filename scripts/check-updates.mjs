@@ -18,6 +18,7 @@
 
 import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { parseUpdates } from './parse-updates.mjs';
@@ -54,6 +55,11 @@ const BODY_TRUNCATE = 700;
 const BARK_BODY_TRUNCATE = 300;
 // Discord 单条消息上限 2000 字符
 const DISCORD_MAX_LENGTH = 2000;
+
+// 心跳保活：GitHub 公共仓库的定时工作流在「60 天无仓库活动」后会被自动停用，
+// 因此页面超过 25 天无更新时，提交一次状态文件作为保活（不触发任何通知，不消耗通知配额）。
+const KEEPALIVE_DAYS = 25;
+const KEEPALIVE_MS = KEEPALIVE_DAYS * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // 小工具函数
@@ -131,11 +137,20 @@ function loadState(file) {
   }
 }
 
-// 写入新状态快照 { checkedAt, entries: [{date, title}] }
-function writeState(file, entries) {
+// 内容哈希：对全部条目的「日期+标题」计算 SHA-256。
+// 只包含日期与标题 —— 正文变动不触发通知（节省通知渠道配额）；
+// 出现新条目（如新模型发布）或已有条目标题被修改时，哈希必然变化。
+function computeHash(metaEntries) {
+  return createHash('sha256').update(JSON.stringify(metaEntries)).digest('hex');
+}
+
+// 写入新状态快照 { checkedAt, entries, hash, lastHeartbeat }
+function writeState(file, entries, hash, lastHeartbeat = null) {
   const state = {
     checkedAt: new Date().toISOString(),
     entries,
+    hash,
+    lastHeartbeat,
   };
   writeFileSync(file, JSON.stringify(state, null, 2) + '\n', 'utf8');
 }
@@ -403,14 +418,33 @@ async function main() {
   const isFirstRun = !state || state.entries.length === 0;
   if (isFirstRun) log('当前为首次运行（状态文件为空或不存在）');
 
-  // 4. 对比新旧条目，找出新条目
+  // 4. 计算内容哈希并对比（哈希 = 全部条目「日期+标题」的 SHA-256）
   const newMeta = entries.map((e) => ({ date: e.date, title: e.title }));
+  const newHash = computeHash(newMeta);
+  // 兼容旧版状态文件（有 entries 但无 hash 字段）：用旧 entries 现算一个 hash 做迁移比对
+  const oldHash = state?.hash ?? (state?.entries?.length ? computeHash(state.entries) : null);
+  const changed = newHash !== oldHash;
   const oldKeys = new Set((state?.entries ?? []).map((e) => `${e.date}|${e.title}`));
-  const changed = JSON.stringify(newMeta) !== JSON.stringify(state?.entries ?? []);
   const newItems = entries.filter((e) => !oldKeys.has(`${e.date}|${e.title}`));
+  log(`内容哈希：${newHash.slice(0, 12)}… ${changed ? '（与上次不同 → 有更新）' : '（与上次一致）'}`);
 
-  // 5. 无变化：静默退出，不发送、不写状态（避免无意义的 commit）
+  // 5. 无内容变化：静默退出；但若超过保活周期或旧状态需要迁移，回写一次状态（不通知、不占配额）
   if (!changed) {
+    const lastHeartbeat = state?.lastHeartbeat ? Date.parse(state.lastHeartbeat) : 0;
+    const heartbeatDue = !isFirstRun && (Date.now() - lastHeartbeat) > KEEPALIVE_MS;
+    const needBackfill = !!state && !state.hash; // 旧版状态缺少 hash 字段，回写一次完成迁移
+    if (heartbeatDue || needBackfill) {
+      log(heartbeatDue
+        ? '页面无更新，但超过保活周期，提交一次心跳状态（不发送通知）'
+        : '旧版状态缺少 hash 字段，回写迁移一次（不发送通知）');
+      if (DRY_RUN) {
+        log('DRY_RUN：将回写心跳状态并输出 keepalive=true');
+      } else {
+        writeState(STATE_FILE, newMeta, newHash, new Date().toISOString());
+        appendGithubOutput(['keepalive=true']);
+      }
+      return 0;
+    }
     log('无更新：页面内容与上次快照一致，跳过通知与状态写入');
     return 0;
   }
@@ -458,14 +492,14 @@ async function main() {
     } else if (ok === 0) {
       // 有渠道配置但全部发送失败：返回非零，让 GitHub 也能收到"失败"邮件
       error(`已配置 ${configured} 个渠道但全部发送失败`);
-      writeState(STATE_FILE, newMeta);
+      writeState(STATE_FILE, newMeta, newHash);
       appendGithubOutput([`has_changes=true`, `new_release=${isRelease}`]);
       return 1;
     }
   }
 
   // 10. 写入新状态快照 + 输出 GitHub Actions 变量
-  writeState(STATE_FILE, newMeta);
+  writeState(STATE_FILE, newMeta, newHash);
   appendGithubOutput([`has_changes=true`, `new_release=${isRelease}`]);
   log('状态文件已更新');
   if (env.GITHUB_OUTPUT) log(`GITHUB_OUTPUT 已写入 has_changes=true, new_release=${isRelease}`);
