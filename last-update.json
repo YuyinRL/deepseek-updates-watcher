@@ -1,6 +1,79 @@
 {
-  "checkedAt": null,
-  "entries": [],
-  "hash": null,
+  "checkedAt": "2026-08-09T09:56:12.926Z",
+  "entries": [
+    {
+      "date": "2026-07-31",
+      "title": "DeepSeek-V4-Flash 更新"
+    },
+    {
+      "date": "2026-04-24",
+      "title": "DeepSeek-V4"
+    },
+    {
+      "date": "2025-12-01",
+      "title": "DeepSeek-V3.2"
+    },
+    {
+      "date": "2025-09-29",
+      "title": "DeepSeek-V3.2-Exp"
+    },
+    {
+      "date": "2025-09-22",
+      "title": "DeepSeek-V3.1-Terminus"
+    },
+    {
+      "date": "2025-08-21",
+      "title": "DeepSeek-V3.1"
+    },
+    {
+      "date": "2025-05-28",
+      "title": "deepseek-reasoner"
+    },
+    {
+      "date": "2025-03-24",
+      "title": "deepseek-chat"
+    },
+    {
+      "date": "2025-01-20",
+      "title": "deepseek-reasoner"
+    },
+    {
+      "date": "2024-12-26",
+      "title": "deepseek-chat"
+    },
+    {
+      "date": "2024-12-10",
+      "title": "deepseek-chat"
+    },
+    {
+      "date": "2024-09-05",
+      "title": "deepseek-coder &amp; deepseek-chat 升级为 DeepSeek V2.5 模型"
+    },
+    {
+      "date": "2024-08-02",
+      "title": "API 上线硬盘缓存技术"
+    },
+    {
+      "date": "2024-07-25",
+      "title": "API 接口更新"
+    },
+    {
+      "date": "2024-07-24",
+      "title": "deepseek-coder"
+    },
+    {
+      "date": "2024-06-28",
+      "title": "deepseek-chat"
+    },
+    {
+      "date": "2024-06-14",
+      "title": "deepseek-coder"
+    },
+    {
+      "date": "2024-05-17",
+      "title": "deepseek-chat"
+    }
+  ],
+  "hash": "b62a9da45bcaf888d6e13d8ec60f82a578d35142b616437d83e2edc335e6807e",
   "lastHeartbeat": null
 }
