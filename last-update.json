@@ -1,5 +1,5 @@
 {
-  "checkedAt": "2026-08-09T09:58:18.687Z",
+  "checkedAt": "2026-08-09T09:57:43.992Z",
   "entries": [
     {
       "date": "2026-07-31",
@@ -74,6 +74,5 @@
       "title": "deepseek-chat"
     }
   ],
-  "hash": "325fc836b87185c3d88fb726d45b6f9988e1b79fdd5be4e8fb947d800733e9d5",
-  "lastHeartbeat": "2026-08-09T09:58:18.687Z"
+  "hash": "325fc836b87185c3d88fb726d45b6f9988e1b79fdd5be4e8fb947d800733e9d5"
 }

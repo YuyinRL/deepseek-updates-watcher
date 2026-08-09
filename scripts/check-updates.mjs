@@ -144,13 +144,12 @@ function computeHash(metaEntries) {
   return createHash('sha256').update(JSON.stringify(metaEntries)).digest('hex');
 }
 
-// 写入新状态快照 { checkedAt, entries, hash, lastHeartbeat }
-function writeState(file, entries, hash, lastHeartbeat = null) {
+// 写入新状态快照 { checkedAt, entries, hash }；checkedAt 同时充当「上次写入/保活时间」
+function writeState(file, entries, hash) {
   const state = {
     checkedAt: new Date().toISOString(),
     entries,
     hash,
-    lastHeartbeat,
   };
   writeFileSync(file, JSON.stringify(state, null, 2) + '\n', 'utf8');
 }
@@ -430,8 +429,9 @@ async function main() {
 
   // 5. 无内容变化：静默退出；但若超过保活周期或旧状态需要迁移，回写一次状态（不通知、不占配额）
   if (!changed) {
-    const lastHeartbeat = state?.lastHeartbeat ? Date.parse(state.lastHeartbeat) : 0;
-    const heartbeatDue = !isFirstRun && (Date.now() - lastHeartbeat) > KEEPALIVE_MS;
+    // 以 checkedAt（上次写入状态的时间）作为保活计时起点；未记录过则视为刚刚写入
+    const lastChecked = state?.checkedAt ? Date.parse(state.checkedAt) : Date.now();
+    const heartbeatDue = !isFirstRun && (Date.now() - lastChecked) > KEEPALIVE_MS;
     const needBackfill = !!state && !state.hash; // 旧版状态缺少 hash 字段，回写一次完成迁移
     if (heartbeatDue || needBackfill) {
       log(heartbeatDue
@@ -440,7 +440,7 @@ async function main() {
       if (DRY_RUN) {
         log('DRY_RUN：将回写心跳状态并输出 keepalive=true');
       } else {
-        writeState(STATE_FILE, newMeta, newHash, new Date().toISOString());
+        writeState(STATE_FILE, newMeta, newHash);
         appendGithubOutput(['keepalive=true']);
       }
       return 0;
