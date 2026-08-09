@@ -33,21 +33,26 @@ export function parseUpdates(html) {
     // 提取标题 <h3>...</h3>，去掉标签得到纯文本；没有 <h3> 时兜底为占位标题
     const titleTag = block.match(/<h3[^>]*>(.*?)<\/h3>/s);
     const title = titleTag
-      ? titleTag[1].replace(/<[^>]+>/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim()
+      ? decodeEntities(titleTag[1].replace(/<[^>]+>/g, '').replace(/[\u200B-\u200D\uFEFF]/g, '')).trim()
       : '(无标题)';
 
-    // 正文 = <h3> 结束之后的所有内容，去掉所有 HTML 标签与实体、压缩空白
+    // 正文 = <h3> 结束之后的所有内容，去掉所有 HTML 标签、解码实体、压缩空白
     const body = block
       .slice(titleTag ? titleTag.index + titleTag[0].length : 0)
       .replace(/<[^>]+>/g, '')
-      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
       .replace(/[\u200B-\u200D\uFEFF]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
 
-    entries.push({ date: date[1], title, body });
+    entries.push({ date: date[1], title, body: decodeEntities(body) });
   }
 
   return entries;
+}
+
+// 解码常见 HTML 实体（标题与正文共用）
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
 }
