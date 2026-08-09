@@ -2,7 +2,7 @@ name: Watch DeepSeek API Updates
 
 on:
   schedule:
-    # 每 5 分钟运行一次（GitHub Actions 支持的最短间隔；UTC 时间）
+    # 每 5 分钟运行一次（GitHub Actions 支持的最短间隔；cron 使用 UTC 时间）
     - cron: '*/5 * * * *'
   workflow_dispatch: # 支持在 Actions 页面手动触发
 
